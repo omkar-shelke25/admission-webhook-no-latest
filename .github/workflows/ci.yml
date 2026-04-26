@@ -9,7 +9,7 @@ on:
 
 env:
   IMAGE_NAME: ghcr.io/${{ github.repository }}
-  GO_VERSION: "1.22"          # matches go.mod (1.26 toolchain, 1.22 is the minimum runtime)
+  GO_VERSION: "1.22"
 
 jobs:
 # ─────────────────────────────────────────────────────────────────────────────
@@ -30,6 +30,9 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
+
+      - name: Tidy and generate go.sum
+        run: go mod tidy
 
       - name: Download dependencies
         run: go mod download
@@ -62,10 +65,10 @@ jobs:
   build:
     name: Build & Push Image
     runs-on: ubuntu-latest
-    needs: test                 # only build if tests pass
+    needs: test
     permissions:
       contents: read
-      packages: write           # needed to push to GHCR
+      packages: write
 
     outputs:
       image-digest: ${{ steps.push.outputs.digest }}
@@ -74,6 +77,15 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Tidy and generate go.sum
+        run: go mod tidy
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -106,7 +118,7 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          provenance: true      # embeds SLSA provenance attestation
+          provenance: true
 
 # ─────────────────────────────────────────────────────────────────────────────
 # JOB 3 — Vulnerability scan with Trivy
@@ -117,7 +129,7 @@ jobs:
     needs: build
     permissions:
       contents: read
-      security-events: write    # upload SARIF to GitHub Security tab
+      security-events: write
 
     steps:
       - name: Checkout code
@@ -138,10 +150,10 @@ jobs:
           output: trivy-results.sarif
           severity: CRITICAL,HIGH
           ignore-unfixed: true
-          exit-code: "1"        # fail the job if CRITICAL/HIGH CVEs found
+          exit-code: "1"
 
       - name: Upload Trivy SARIF to GitHub Security tab
-        if: always()            # upload even if scan found issues
+        if: always()
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: trivy-results.sarif
@@ -164,7 +176,7 @@ jobs:
     needs: build
     permissions:
       contents: read
-      packages: write           # needed to attach SBOM attestation to image
+      packages: write
 
     steps:
       - name: Checkout code
