@@ -2,7 +2,7 @@ package main
 
 import (
 	"encoding/json"
-	"flag"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -14,15 +14,34 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// logger uses Go 1.21+ structured logging (slog) with JSON output.
-var logger = slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-	Level: slog.LevelInfo,
-}))
+// ─── Config ───────────────────────────────────────────────────────────────────
 
-// hasLatestTag returns true when the image uses ":latest" or has no tag at all.
+// Config holds all runtime configuration for the webhook server.
+// Keeping it as a struct makes it easy to construct in tests.
+type Config struct {
+	Addr     string
+	CertFile string
+	KeyFile  string
+	DevMode  bool
+}
+
+// DefaultConfig returns a Config with production defaults.
+func DefaultConfig() Config {
+	return Config{
+		Addr:     ":8443",
+		CertFile: "/etc/webhook/certs/tls.crt",
+		KeyFile:  "/etc/webhook/certs/tls.key",
+		DevMode:  false,
+	}
+}
+
+// ─── Image tag validation ─────────────────────────────────────────────────────
+
+// hasLatestTag returns true when the image uses ":latest", has no tag at all,
+// or has an empty tag — all of which resolve to "latest" at runtime.
 // Images pinned by digest (e.g. nginx@sha256:abc…) are always allowed.
 func hasLatestTag(image string) bool {
-	// Digest references are immutable — allow them.
+	// Digest references are immutable — always allow them.
 	if strings.Contains(image, "@") {
 		return false
 	}
@@ -35,8 +54,8 @@ func hasLatestTag(image string) bool {
 	return tag == "latest" || tag == ""
 }
 
-// validateContainers returns a violation string for every container whose
-// image uses an unpinned tag.
+// validateContainers returns a violation message for every container
+// whose image uses an unpinned or "latest" tag.
 func validateContainers(containers []corev1.Container, kind string) []string {
 	var violations []string
 	for _, c := range containers {
@@ -52,8 +71,69 @@ func validateContainers(containers []corev1.Container, kind string) []string {
 	return violations
 }
 
-// reviewHandler is the ValidatingWebhook admission endpoint.
-func reviewHandler(w http.ResponseWriter, r *http.Request) {
+// ─── Admission logic ──────────────────────────────────────────────────────────
+
+// ErrNilRequest is returned when the AdmissionReview carries no Request.
+var ErrNilRequest = errors.New("admission request is nil")
+
+// admit performs the core admission decision and returns an AdmissionResponse.
+// It is a pure function with no HTTP concerns — fully unit-testable.
+func admit(req *admissionv1.AdmissionRequest) (*admissionv1.AdmissionResponse, error) {
+	if req == nil {
+		return nil, ErrNilRequest
+	}
+
+	var pod corev1.Pod
+	if err := json.Unmarshal(req.Object.Raw, &pod); err != nil {
+		return nil, fmt.Errorf("unmarshal pod: %w", err)
+	}
+
+	var allViolations []string
+	allViolations = append(allViolations, validateContainers(pod.Spec.InitContainers, "init")...)
+	allViolations = append(allViolations, validateContainers(pod.Spec.Containers, "app")...)
+
+	resp := &admissionv1.AdmissionResponse{UID: req.UID}
+
+	if len(allViolations) == 0 {
+		resp.Allowed = true
+	} else {
+		resp.Allowed = false
+		resp.Result = &metav1.Status{
+			Code:    http.StatusForbidden,
+			Message: "Image policy violation:\n" + strings.Join(allViolations, "\n"),
+		}
+	}
+
+	return resp, nil
+}
+
+// ─── HTTP handlers ────────────────────────────────────────────────────────────
+
+// Server wraps an http.ServeMux and a structured logger.
+// Using a struct lets tests inject a custom logger and inspect behaviour.
+type Server struct {
+	mux    *http.ServeMux
+	logger *slog.Logger
+}
+
+// NewServer wires up all routes and returns a ready-to-use Server.
+func NewServer(logger *slog.Logger) *Server {
+	s := &Server{
+		mux:    http.NewServeMux(),
+		logger: logger,
+	}
+	s.mux.HandleFunc("/validate", s.handleValidate)
+	s.mux.HandleFunc("/healthz", s.handleHealthz)
+	return s
+}
+
+// ServeHTTP makes Server implement http.Handler so it works with httptest.
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	s.mux.ServeHTTP(w, r)
+}
+
+// handleValidate is the ValidatingWebhook admission endpoint.
+func (s *Server) handleValidate(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "only POST is accepted", http.StatusMethodNotAllowed)
 		return
@@ -61,94 +141,102 @@ func reviewHandler(w http.ResponseWriter, r *http.Request) {
 
 	var review admissionv1.AdmissionReview
 	if err := json.NewDecoder(r.Body).Decode(&review); err != nil {
-		logger.Error("failed to decode admission review", "error", err)
+		s.logger.Error("failed to decode admission review", "error", err)
 		http.Error(w, "invalid request body", http.StatusBadRequest)
 		return
 	}
 
-	req := review.Request
-	if req == nil {
+	if review.Request == nil {
+		s.logger.Error("admission request is nil")
 		http.Error(w, "admission request is nil", http.StatusBadRequest)
 		return
 	}
 
-	logger.Info("reviewing pod",
-		"name", req.Name,
-		"namespace", req.Namespace,
-		"operation", req.Operation,
+	s.logger.Info("reviewing pod",
+		"name", review.Request.Name,
+		"namespace", review.Request.Namespace,
+		"operation", review.Request.Operation,
 	)
 
-	var pod corev1.Pod
-	if err := json.Unmarshal(req.Object.Raw, &pod); err != nil {
-		logger.Error("failed to unmarshal pod", "error", err)
-		http.Error(w, "failed to decode pod", http.StatusInternalServerError)
+	resp, err := admit(review.Request)
+	if err != nil {
+		s.logger.Error("admission error", "error", err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	// Check both init containers and regular containers.
-	var allViolations []string
-	allViolations = append(allViolations, validateContainers(pod.Spec.InitContainers, "init")...)
-	allViolations = append(allViolations, validateContainers(pod.Spec.Containers, "app")...)
-
-	response := &admissionv1.AdmissionResponse{UID: req.UID}
-
-	if len(allViolations) == 0 {
-		response.Allowed = true
-		logger.Info("pod allowed", "name", req.Name, "namespace", req.Namespace)
+	if resp.Allowed {
+		s.logger.Info("pod allowed",
+			"name", review.Request.Name,
+			"namespace", review.Request.Namespace,
+		)
 	} else {
-		response.Allowed = false
-		message := "Image policy violation:\n" + strings.Join(allViolations, "\n")
-		response.Result = &metav1.Status{
-			Code:    http.StatusForbidden,
-			Message: message,
-		}
-		logger.Warn("pod denied",
-			"name", req.Name,
-			"namespace", req.Namespace,
-			"violations", allViolations,
+		s.logger.Warn("pod denied",
+			"name", review.Request.Name,
+			"namespace", review.Request.Namespace,
+			"message", resp.Result.Message,
 		)
 	}
 
-	review.Response = response
+	review.Response = resp
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(review); err != nil {
-		logger.Error("failed to encode response", "error", err)
+		s.logger.Error("failed to encode response", "error", err)
 	}
 }
 
-func healthzHandler(w http.ResponseWriter, _ *http.Request) {
+// handleHealthz responds to liveness/readiness probes.
+func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("ok"))
 }
 
+// ─── Runner ───────────────────────────────────────────────────────────────────
+
+// Run starts the HTTP(S) server according to cfg.
+// Extracted from main() so it can be tested independently.
+func Run(cfg Config, logger *slog.Logger) error {
+	srv := NewServer(logger)
+
+	httpServer := &http.Server{
+		Addr:    cfg.Addr,
+		Handler: srv,
+	}
+
+	if cfg.DevMode {
+		logger.Warn("running in HTTP dev mode — NEVER use in production", "addr", cfg.Addr)
+		return httpServer.ListenAndServe()
+	}
+
+	logger.Info("starting no-latest-tag webhook (TLS)", "addr", cfg.Addr)
+	return httpServer.ListenAndServeTLS(cfg.CertFile, cfg.KeyFile)
+}
+
+// ─── Entry point ──────────────────────────────────────────────────────────────
+
 func main() {
-	devMode := flag.Bool("dev", false, "run HTTP instead of HTTPS (local testing only — never in production)")
-	certFile := flag.String("cert", "/etc/webhook/certs/tls.crt", "path to TLS certificate")
-	keyFile  := flag.String("key",  "/etc/webhook/certs/tls.key", "path to TLS private key")
-	addr     := flag.String("addr", ":8443", "listen address")
-	flag.Parse()
+	cfg := DefaultConfig()
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/validate", reviewHandler)
-	mux.HandleFunc("/healthz", healthzHandler)
-
-	server := &http.Server{
-		Addr:    *addr,
-		Handler: mux,
+	// Parse env vars (simpler than flags for container deployments)
+	if v := os.Getenv("WEBHOOK_ADDR"); v != "" {
+		cfg.Addr = v
+	}
+	if v := os.Getenv("WEBHOOK_CERT"); v != "" {
+		cfg.CertFile = v
+	}
+	if v := os.Getenv("WEBHOOK_KEY"); v != "" {
+		cfg.KeyFile = v
+	}
+	if os.Getenv("WEBHOOK_DEV_MODE") == "true" {
+		cfg.DevMode = true
 	}
 
-	if *devMode {
-		logger.Warn("running in HTTP dev mode — NEVER use in production", "addr", *addr)
-		if err := server.ListenAndServe(); err != nil {
-			logger.Error("server error", "error", err)
-			os.Exit(1)
-		}
-		return
-	}
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	}))
 
-	logger.Info("starting no-latest-tag webhook (TLS)", "addr", *addr)
-	if err := server.ListenAndServeTLS(*certFile, *keyFile); err != nil {
-		logger.Error("server error", "error", err)
+	if err := Run(cfg, logger); err != nil {
+		logger.Error("server stopped", "error", err)
 		os.Exit(1)
 	}
 }
