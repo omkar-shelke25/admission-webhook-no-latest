@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"encoding/json"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"testing"
+	"time"
 
 	admissionv1 "k8s.io/api/admission/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -164,7 +166,7 @@ func TestAdmit_InvalidPodJSON(t *testing.T) {
 	t.Parallel()
 	req := &admissionv1.AdmissionRequest{
 		UID:    "uid-bad",
-		Object: runtime.RawExtension{Raw: []byte("not-valid-json{{")},
+		Object: runtime.RawExtension{Raw: []byte(`[1, 2, 3]`)},
 	}
 	_, err := admit(req)
 	if err == nil {
@@ -410,7 +412,6 @@ func TestHandleValidate_RejectsMalformedJSON(t *testing.T) {
 }
 
 func TestHandleValidate_RejectsNilRequest(t *testing.T) {
-	// Build a review with no Request field
 	review := admissionv1.AdmissionReview{
 		TypeMeta: metav1.TypeMeta{APIVersion: "admission.k8s.io/v1", Kind: "AdmissionReview"},
 	}
@@ -425,13 +426,15 @@ func TestHandleValidate_RejectsNilRequest(t *testing.T) {
 }
 
 func TestHandleValidate_RejectsBadPodJSON(t *testing.T) {
-	// Build a review whose Object.Raw is not a valid Pod
+	// Object.Raw must be valid JSON so the outer Marshal succeeds and the body
+	// reaches the handler intact. A JSON array cannot unmarshal into a Pod
+	// struct, so admit() returns an error and the handler responds with 500.
 	review := admissionv1.AdmissionReview{
 		TypeMeta: metav1.TypeMeta{APIVersion: "admission.k8s.io/v1", Kind: "AdmissionReview"},
 		Request: &admissionv1.AdmissionRequest{
 			UID:       "uid-badpod",
 			Operation: admissionv1.Create,
-			Object:    runtime.RawExtension{Raw: []byte("{{not a pod")},
+			Object:    runtime.RawExtension{Raw: []byte(`[1, 2, 3]`)},
 		},
 	}
 	body, _ := json.Marshal(review)
@@ -478,5 +481,52 @@ func TestNewServer_RoutesRegistered(t *testing.T) {
 		if rec.Code == http.StatusNotFound {
 			t.Errorf("route %s not registered", path)
 		}
+	}
+}
+
+// ─── Run / main coverage ─────────────────────────────────────────────────────
+
+func TestRun_DevMode_StartsAndStops(t *testing.T) {
+	// Pick a random free port so we don't conflict with other tests.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("could not find free port: %v", err)
+	}
+	addr := ln.Addr().String()
+	ln.Close() // release it; Run will re-bind
+
+	cfg := Config{
+		Addr:    addr,
+		DevMode: true, // plain HTTP — no cert files needed
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- Run(cfg, noopLogger)
+	}()
+
+	// Give the server a moment to start, then send a health probe.
+	time.Sleep(50 * time.Millisecond)
+	resp, err := http.Get("http://" + addr + "/healthz")
+	if err != nil {
+		t.Fatalf("healthz probe failed: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200, got %d", resp.StatusCode)
+	}
+}
+
+func TestRun_TLSMode_MissingCert(t *testing.T) {
+	// TLS mode with non-existent cert files must return an error immediately.
+	cfg := Config{
+		Addr:     "127.0.0.1:0",
+		CertFile: "/nonexistent/tls.crt",
+		KeyFile:  "/nonexistent/tls.key",
+		DevMode:  false,
+	}
+	err := Run(cfg, noopLogger)
+	if err == nil {
+		t.Error("expected error for missing TLS cert, got nil")
 	}
 }
