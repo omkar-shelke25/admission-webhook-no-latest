@@ -52,12 +52,17 @@ jobs:
       - name: Print coverage summary
         run: go tool cover -func=coverage.out
 
+      - name: Verify coverage file exists
+        run: ls -lah coverage.out
+
       - name: Upload coverage report
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: coverage-report
           path: coverage.out
-          retention-days: 7
+          retention-days: 30
+          if-no-files-found: error
 
 # ─────────────────────────────────────────────────────────────────────────────
 # JOB 2 — Docker build + push to GHCR
@@ -194,6 +199,10 @@ jobs:
           ignore-unfixed: true
           exit-code: "0"
 
+      - name: Verify Trivy SARIF exists
+        if: always()
+        run: ls -lah trivy-results.sarif 2>/dev/null || echo "trivy-results.sarif not found"
+
       - name: Upload Trivy SARIF to GitHub Security tab
         if: always()
         uses: github/codeql-action/upload-sarif@v4
@@ -207,10 +216,11 @@ jobs:
         with:
           name: trivy-sarif
           path: trivy-results.sarif
-          retention-days: 7
+          retention-days: 30
+          if-no-files-found: warn
 
 # ─────────────────────────────────────────────────────────────────────────────
-# JOB 5 — SBOM generation with Syft
+# JOB 5 — SBOM generation with Syft CLI
 # ─────────────────────────────────────────────────────────────────────────────
   sbom:
     name: Generate SBOM (Syft)
@@ -271,19 +281,34 @@ jobs:
               sys.exit(1)
           "
 
+      - name: Verify SBOM files before upload
+        run: |
+          echo "=== SBOM files ==="
+          ls -lah sbom.spdx.json sbom.cyclonedx.json
+
       - name: Upload SPDX SBOM artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: sbom-spdx
-          path: sbom.spdx.json        # ← explicit file, not a directory
-          retention-days: 7
+          path: sbom.spdx.json
+          retention-days: 30
+          if-no-files-found: error
 
       - name: Upload CycloneDX SBOM artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: sbom-cyclonedx
           path: sbom.cyclonedx.json
-          retention-days: 7
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Attach SBOM attestation to image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: anchore/sbom-action/publish-sbom@v0
+        with:
+          sbom-artifact-match: ".*\\.spdx\\.json$"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # JOB 6 — Vulnerability scan with Grype (from SBOM — no image pull needed)
@@ -306,12 +331,28 @@ jobs:
           name: sbom-spdx
           path: sbom-dir
 
-      - name: Show downloaded SBOM
+      - name: Debug — inspect downloaded artifact
         run: |
-          echo "--- contents of sbom-dir ---"
+          echo "=== Directory tree ==="
+          find sbom-dir -print | sed 's|[^/]*/|  |g'
+
+          echo ""
+          echo "=== File details ==="
           ls -lah sbom-dir/
-          echo "--- SBOM head ---"
-          head -c 300 sbom-dir/sbom.spdx.json
+
+          echo ""
+          echo "=== File type ==="
+          file sbom-dir/* 2>/dev/null || echo "file command failed"
+
+          echo ""
+          echo "=== First 300 bytes ==="
+          head -c 300 sbom-dir/* 2>/dev/null || echo "could not read file"
+
+          echo ""
+          echo "=== Resolve SBOM path ==="
+          SBOM_FILE=$(find sbom-dir -type f | head -1)
+          echo "SBOM file: $SBOM_FILE"
+          echo "SBOM_PATH=$SBOM_FILE" >> "$GITHUB_ENV"
 
       - name: Install Grype
         run: |
@@ -323,9 +364,10 @@ jobs:
         run: |
           set +e
 
-          grype "sbom:sbom-dir/sbom.spdx.json" \
-            --output sarif \
-            --file grype-results.sarif \
+          echo "Scanning SBOM at: $SBOM_PATH"
+          grype "sbom:${SBOM_PATH}" \
+            --output sarif=grype-results.sarif \
+            --output table \
             --add-cpes-if-none \
             -v
 
@@ -370,4 +412,5 @@ jobs:
         with:
           name: grype-sarif
           path: grype-results.sarif
-          retention-days: 7
+          retention-days: 30
+          if-no-files-found: warn
