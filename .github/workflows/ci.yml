@@ -221,7 +221,6 @@ jobs:
       packages: write
 
     outputs:
-      # Tells the grype job which artifact name to download
       sbom-artifact-name: sbom-spdx
 
     steps:
@@ -235,13 +234,15 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Create SBOM output directory
+        run: mkdir -p sbom-output
+
       - name: Generate SBOM (SPDX JSON) via Syft
         uses: anchore/sbom-action@v0
         with:
           image: ${{ needs.build.outputs.image-ref }}
           format: spdx-json
-          # Write to workspace so the next step can validate it
-          output-file: sbom.spdx.json
+          output-file: ./sbom-output/sbom.spdx.json
           upload-artifact: true
           artifact-name: sbom-spdx
 
@@ -250,20 +251,21 @@ jobs:
         with:
           image: ${{ needs.build.outputs.image-ref }}
           format: cyclonedx-json
-          output-file: sbom.cyclonedx.json
+          output-file: ./sbom-output/sbom.cyclonedx.json
           upload-artifact: true
           artifact-name: sbom-cyclonedx
 
       - name: Validate SBOM is non-empty valid JSON
         run: |
-          if [ ! -s sbom.spdx.json ]; then
+          ls -lah sbom-output/
+          if [ ! -s sbom-output/sbom.spdx.json ]; then
             echo "ERROR: sbom.spdx.json is empty or missing"
             exit 1
           fi
           python3 -c "
           import json, sys
           try:
-              data = json.load(open('sbom.spdx.json'))
+              data = json.load(open('sbom-output/sbom.spdx.json'))
               pkgs = len(data.get('packages', []))
               print(f'SBOM valid — {pkgs} packages listed')
           except Exception as e:
@@ -283,7 +285,6 @@ jobs:
   grype:
     name: Vulnerability Scan (Grype via SBOM)
     runs-on: ubuntu-latest
-    # Grype runs AFTER sbom so it can consume the SPDX artifact
     needs: sbom
     permissions:
       contents: read
@@ -293,18 +294,25 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # Download the SPDX SBOM that Syft produced in the sbom job
       - name: Download SBOM artifact
         uses: actions/download-artifact@v4
         with:
           name: sbom-spdx
           path: sbom-dir
 
-      - name: Show downloaded SBOM
+      - name: Show downloaded SBOM and resolve filename
         run: |
+          echo "--- contents of sbom-dir ---"
           ls -lah sbom-dir/
-          echo "--- SBOM head ---"
-          head -c 300 sbom-dir/sbom.spdx.json
+          # Find the spdx json regardless of exact filename
+          SBOM_FILE=$(find sbom-dir -name "*.json" | head -1)
+          if [ -z "$SBOM_FILE" ]; then
+            echo "ERROR: no JSON file found in sbom-dir"
+            exit 1
+          fi
+          echo "Found SBOM at: $SBOM_FILE"
+          echo "SBOM_PATH=$SBOM_FILE" >> "$GITHUB_ENV"
+          head -c 300 "$SBOM_FILE"
 
       - name: Install Grype
         run: |
@@ -312,13 +320,12 @@ jobs:
             | sh -s -- -b /usr/local/bin
           grype version
 
-      # Feed the SBOM directly into Grype using sbom: scheme —
-      # no registry login, no image pull, no network call to GHCR needed.
       - name: Run Grype against SBOM
         run: |
           set +e
 
-          grype "sbom:sbom-dir/sbom.spdx.json" \
+          echo "Scanning SBOM at: $SBOM_PATH"
+          grype "sbom:${SBOM_PATH}" \
             --output sarif \
             --file grype-results.sarif \
             --add-cpes-if-none \
@@ -329,7 +336,6 @@ jobs:
           echo "--- grype-results.sarif size: $(wc -c < grype-results.sarif 2>/dev/null || echo 'FILE MISSING') bytes ---"
 
           set -e
-          # Exit code 1 = hard error, exit code 0/2 = scan completed (with or without findings)
           if [ "$GRYPE_EXIT" -eq 1 ]; then
             echo "Grype encountered a hard error"
             exit 1
