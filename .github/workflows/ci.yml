@@ -210,15 +210,19 @@ jobs:
           retention-days: 7
 
 # ─────────────────────────────────────────────────────────────────────────────
-# JOB 5 — Vulnerability scan with Grype
+# JOB 5 — SBOM generation with Syft
 # ─────────────────────────────────────────────────────────────────────────────
-  grype:
-    name: Vulnerability Scan (Grype)
+  sbom:
+    name: Generate SBOM (Syft)
     runs-on: ubuntu-latest
     needs: build
     permissions:
       contents: read
-      security-events: write
+      packages: write
+
+    outputs:
+      # Tells the grype job which artifact name to download
+      sbom-artifact-name: sbom-spdx
 
     steps:
       - name: Checkout code
@@ -231,53 +235,119 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Generate SBOM (SPDX JSON) via Syft
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ needs.build.outputs.image-ref }}
+          format: spdx-json
+          # Write to workspace so the next step can validate it
+          output-file: sbom.spdx.json
+          upload-artifact: true
+          artifact-name: sbom-spdx
+
+      - name: Generate SBOM (CycloneDX JSON) via Syft
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ needs.build.outputs.image-ref }}
+          format: cyclonedx-json
+          output-file: sbom.cyclonedx.json
+          upload-artifact: true
+          artifact-name: sbom-cyclonedx
+
+      - name: Validate SBOM is non-empty valid JSON
+        run: |
+          if [ ! -s sbom.spdx.json ]; then
+            echo "ERROR: sbom.spdx.json is empty or missing"
+            exit 1
+          fi
+          python3 -c "
+          import json, sys
+          try:
+              data = json.load(open('sbom.spdx.json'))
+              pkgs = len(data.get('packages', []))
+              print(f'SBOM valid — {pkgs} packages listed')
+          except Exception as e:
+              print(f'Invalid JSON: {e}')
+              sys.exit(1)
+          "
+
+      - name: Attach SBOM attestation to image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: anchore/sbom-action/publish-sbom@v0
+        with:
+          sbom-artifact-match: ".*\\.spdx\\.json$"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# JOB 6 — Vulnerability scan with Grype (from SBOM — no image pull needed)
+# ─────────────────────────────────────────────────────────────────────────────
+  grype:
+    name: Vulnerability Scan (Grype via SBOM)
+    runs-on: ubuntu-latest
+    # Grype runs AFTER sbom so it can consume the SPDX artifact
+    needs: sbom
+    permissions:
+      contents: read
+      security-events: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Download the SPDX SBOM that Syft produced in the sbom job
+      - name: Download SBOM artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: sbom-spdx
+          path: sbom-dir
+
+      - name: Show downloaded SBOM
+        run: |
+          ls -lah sbom-dir/
+          echo "--- SBOM head ---"
+          head -c 300 sbom-dir/sbom.spdx.json
+
       - name: Install Grype
         run: |
           curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh \
             | sh -s -- -b /usr/local/bin
           grype version
 
-      - name: Pull image locally
+      # Feed the SBOM directly into Grype using sbom: scheme —
+      # no registry login, no image pull, no network call to GHCR needed.
+      - name: Run Grype against SBOM
         run: |
-          docker pull ${{ needs.build.outputs.image-ref }}
-          docker images
+          set +e
 
-      - name: Run Grype scan
-        run: |
-          set +e  # do not exit on non-zero so we capture all output
-
-          grype "${{ needs.build.outputs.image-ref }}" \
+          grype "sbom:sbom-dir/sbom.spdx.json" \
             --output sarif \
             --file grype-results.sarif \
             --add-cpes-if-none \
             -v
-          GRYPE_EXIT=$?
 
+          GRYPE_EXIT=$?
           echo "--- Grype exit code: $GRYPE_EXIT ---"
           echo "--- grype-results.sarif size: $(wc -c < grype-results.sarif 2>/dev/null || echo 'FILE MISSING') bytes ---"
-          echo "--- grype-results.sarif head ---"
-          head -c 500 grype-results.sarif 2>/dev/null || echo "FILE MISSING OR EMPTY"
 
           set -e
-          # Exit non-zero only on actual errors (exit 1), not on findings (exit 0 or 2)
+          # Exit code 1 = hard error, exit code 0/2 = scan completed (with or without findings)
           if [ "$GRYPE_EXIT" -eq 1 ]; then
-            echo "Grype failed with a hard error"
+            echo "Grype encountered a hard error"
             exit 1
           fi
 
-      - name: Validate SARIF is non-empty valid JSON
+      - name: Validate Grype SARIF is non-empty valid JSON
         run: |
           if [ ! -s grype-results.sarif ]; then
             echo "ERROR: grype-results.sarif is empty or missing"
-            ls -lah grype-results.sarif 2>/dev/null || echo "file does not exist"
             exit 1
           fi
           python3 -c "
           import json, sys
           try:
               data = json.load(open('grype-results.sarif'))
-              print('SARIF is valid JSON')
-              print(f'runs count: {len(data.get(\"runs\", []))}')
+              runs = len(data.get('runs', []))
+              results = len(data['runs'][0].get('results', [])) if runs > 0 else 0
+              print(f'SARIF valid — {runs} run(s), {results} finding(s)')
           except Exception as e:
               print(f'Invalid JSON: {e}')
               sys.exit(1)
@@ -297,49 +367,3 @@ jobs:
           name: grype-sarif
           path: grype-results.sarif
           retention-days: 7
-
-# ─────────────────────────────────────────────────────────────────────────────
-# JOB 6 — SBOM generation with Syft
-# ─────────────────────────────────────────────────────────────────────────────
-  sbom:
-    name: Generate SBOM (Syft)
-    runs-on: ubuntu-latest
-    needs: build
-    permissions:
-      contents: read
-      packages: write
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Generate SBOM (SPDX JSON)
-        uses: anchore/sbom-action@v0
-        with:
-          image: ${{ needs.build.outputs.image-ref }}
-          format: spdx-json
-          output-file: sbom.spdx.json
-          upload-artifact: true
-          artifact-name: sbom-spdx
-
-      - name: Generate SBOM (CycloneDX JSON)
-        uses: anchore/sbom-action@v0
-        with:
-          image: ${{ needs.build.outputs.image-ref }}
-          format: cyclonedx-json
-          output-file: sbom.cyclonedx.json
-          upload-artifact: true
-          artifact-name: sbom-cyclonedx
-
-      - name: Attach SBOM attestation to image
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: anchore/sbom-action/publish-sbom@v0
-        with:
-          sbom-artifact-match: ".*\\.spdx\\.json$"
