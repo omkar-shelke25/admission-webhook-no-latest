@@ -1,5 +1,5 @@
 # .github/workflows/ci.yml
-name: CI — Test · Build · Scan · SBOM
+name: CI — Test · Build · Scan · SBOM · Sign
 
 on:
   push:
@@ -71,9 +71,8 @@ jobs:
       packages: write
 
     outputs:
-      # Single immutable sha-tag used by scan and sbom jobs.
-      # Format: ghcr.io/owner/repo:sha-<short-sha>
       image-ref: ${{ steps.image-ref.outputs.value }}
+      image-digest: ${{ steps.push.outputs.digest }}
 
     steps:
       - name: Checkout code
@@ -121,8 +120,7 @@ jobs:
           cache-to: type=gha,mode=max
           provenance: true
 
-      # Build a single, stable image reference for downstream jobs.
-      # We use the sha- tag because it is always present on both push and PR.
+      # Single immutable sha-tag used by all downstream jobs
       - name: Set single image ref output
         id: image-ref
         run: |
@@ -130,9 +128,49 @@ jobs:
           echo "value=${{ env.IMAGE_NAME }}:sha-${SHA_SHORT}" >> "$GITHUB_OUTPUT"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# JOB 3 — Vulnerability scan with Trivy
+# JOB 3 — Cosign image signing (keyless via OIDC)
 # ─────────────────────────────────────────────────────────────────────────────
-  scan:
+  sign:
+    name: Sign Image (Cosign)
+    runs-on: ubuntu-latest
+    needs: build
+    # Signing only makes sense on pushes to main, not on PRs
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      packages: write       # push the signature to GHCR
+      id-token: write       # required for keyless OIDC signing
+
+    steps:
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Sign using the immutable digest (not the tag) so the signature is
+      # cryptographically bound to exactly the bytes that were pushed.
+      - name: Sign image with Cosign (keyless OIDC)
+        run: |
+          cosign sign --yes \
+            "${{ env.IMAGE_NAME }}@${{ needs.build.outputs.image-digest }}"
+
+      # Optionally verify the signature immediately after signing
+      - name: Verify Cosign signature
+        run: |
+          cosign verify \
+            --certificate-identity-regexp="https://github.com/${{ github.repository }}/*" \
+            --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
+            "${{ env.IMAGE_NAME }}@${{ needs.build.outputs.image-digest }}"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# JOB 4 — Vulnerability scan with Trivy
+# ─────────────────────────────────────────────────────────────────────────────
+  trivy:
     name: Vulnerability Scan (Trivy)
     runs-on: ubuntu-latest
     needs: build
@@ -159,7 +197,7 @@ jobs:
           output: trivy-results.sarif
           severity: CRITICAL,HIGH
           ignore-unfixed: true
-          exit-code: "0"        # report findings but do not fail the job
+          exit-code: "0"
 
       - name: Upload Trivy SARIF to GitHub Security tab
         if: always()
@@ -177,7 +215,53 @@ jobs:
           retention-days: 7
 
 # ─────────────────────────────────────────────────────────────────────────────
-# JOB 4 — SBOM generation with Syft
+# JOB 5 — Vulnerability scan with Grype
+# ─────────────────────────────────────────────────────────────────────────────
+  grype:
+    name: Vulnerability Scan (Grype)
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      contents: read
+      security-events: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run Grype vulnerability scan
+        id: grype
+        uses: anchore/scan-action@v3
+        with:
+          image: ${{ needs.build.outputs.image-ref }}
+          severity-cutoff: critical
+          output-format: sarif
+          fail-build: false     # report findings, do not fail the job
+
+      - name: Upload Grype SARIF to GitHub Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: ${{ steps.grype.outputs.sarif }}
+          category: grype
+
+      - name: Upload Grype SARIF as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: grype-sarif
+          path: ${{ steps.grype.outputs.sarif }}
+          retention-days: 7
+
+# ─────────────────────────────────────────────────────────────────────────────
+# JOB 6 — SBOM generation with Syft
 # ─────────────────────────────────────────────────────────────────────────────
   sbom:
     name: Generate SBOM (Syft)
@@ -215,3 +299,10 @@ jobs:
           output-file: sbom.cyclonedx.json
           upload-artifact: true
           artifact-name: sbom-cyclonedx
+
+      # Attach the SBOM as a signed attestation on the image (main only)
+      - name: Attach SBOM attestation to image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: anchore/sbom-action/publish-sbom@v0
+        with:
+          sbom-artifact-match: ".*\\.spdx\\.json$"
