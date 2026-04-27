@@ -1,1 +1,1 @@
-
+[![CI — Test · Build · Scan · SBOM · Sign](https://github.com/omkar-shelke25/admission-webhook-no-latest/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/omkar-shelke25/admission-webhook-no-latest/actions/workflows/ci.yml)
