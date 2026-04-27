@@ -232,27 +232,56 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install Grype
-        uses: anchore/scan-action/download-grype@v3
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh \
+            | sh -s -- -b /usr/local/bin
+          grype version
 
       - name: Pull image locally
-        run: docker pull ${{ needs.build.outputs.image-ref }}
-
-      - name: Run Grype and write SARIF to known path
         run: |
+          docker pull ${{ needs.build.outputs.image-ref }}
+          docker images
+
+      - name: Run Grype scan
+        run: |
+          set +e  # do not exit on non-zero so we capture all output
+
           grype "${{ needs.build.outputs.image-ref }}" \
             --output sarif \
             --file grype-results.sarif \
-            --fail-on critical \
-            || true
+            --add-cpes-if-none \
+            -v
+          GRYPE_EXIT=$?
 
-      - name: Verify SARIF file exists and is valid JSON
+          echo "--- Grype exit code: $GRYPE_EXIT ---"
+          echo "--- grype-results.sarif size: $(wc -c < grype-results.sarif 2>/dev/null || echo 'FILE MISSING') bytes ---"
+          echo "--- grype-results.sarif head ---"
+          head -c 500 grype-results.sarif 2>/dev/null || echo "FILE MISSING OR EMPTY"
+
+          set -e
+          # Exit non-zero only on actual errors (exit 1), not on findings (exit 0 or 2)
+          if [ "$GRYPE_EXIT" -eq 1 ]; then
+            echo "Grype failed with a hard error"
+            exit 1
+          fi
+
+      - name: Validate SARIF is non-empty valid JSON
         run: |
           if [ ! -s grype-results.sarif ]; then
             echo "ERROR: grype-results.sarif is empty or missing"
+            ls -lah grype-results.sarif 2>/dev/null || echo "file does not exist"
             exit 1
           fi
-          python3 -c "import json,sys; json.load(open('grype-results.sarif'))" \
-            && echo "SARIF JSON is valid"
+          python3 -c "
+          import json, sys
+          try:
+              data = json.load(open('grype-results.sarif'))
+              print('SARIF is valid JSON')
+              print(f'runs count: {len(data.get(\"runs\", []))}')
+          except Exception as e:
+              print(f'Invalid JSON: {e}')
+              sys.exit(1)
+          "
 
       - name: Upload Grype SARIF to GitHub Security tab
         if: always()
