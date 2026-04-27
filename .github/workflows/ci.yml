@@ -234,38 +234,36 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Create SBOM output directory
-        run: mkdir -p sbom-output
+      - name: Install Syft
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
+            | sh -s -- -b /usr/local/bin
+          syft version
 
-      - name: Generate SBOM (SPDX JSON) via Syft
-        uses: anchore/sbom-action@v0
-        with:
-          image: ${{ needs.build.outputs.image-ref }}
-          format: spdx-json
-          output-file: ./sbom-output/sbom.spdx.json
-          upload-artifact: true
-          artifact-name: sbom-spdx
+      - name: Generate SBOM (SPDX JSON) via Syft CLI
+        run: |
+          syft "${{ needs.build.outputs.image-ref }}" \
+            --output spdx-json=sbom.spdx.json \
+            -v
+          echo "--- SBOM size: $(wc -c < sbom.spdx.json) bytes ---"
 
-      - name: Generate SBOM (CycloneDX JSON) via Syft
-        uses: anchore/sbom-action@v0
-        with:
-          image: ${{ needs.build.outputs.image-ref }}
-          format: cyclonedx-json
-          output-file: ./sbom-output/sbom.cyclonedx.json
-          upload-artifact: true
-          artifact-name: sbom-cyclonedx
+      - name: Generate SBOM (CycloneDX JSON) via Syft CLI
+        run: |
+          syft "${{ needs.build.outputs.image-ref }}" \
+            --output cyclonedx-json=sbom.cyclonedx.json \
+            -v
+          echo "--- CycloneDX size: $(wc -c < sbom.cyclonedx.json) bytes ---"
 
       - name: Validate SBOM is non-empty valid JSON
         run: |
-          ls -lah sbom-output/
-          if [ ! -s sbom-output/sbom.spdx.json ]; then
+          if [ ! -s sbom.spdx.json ]; then
             echo "ERROR: sbom.spdx.json is empty or missing"
             exit 1
           fi
           python3 -c "
           import json, sys
           try:
-              data = json.load(open('sbom-output/sbom.spdx.json'))
+              data = json.load(open('sbom.spdx.json'))
               pkgs = len(data.get('packages', []))
               print(f'SBOM valid — {pkgs} packages listed')
           except Exception as e:
@@ -273,11 +271,19 @@ jobs:
               sys.exit(1)
           "
 
-      - name: Attach SBOM attestation to image
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: anchore/sbom-action/publish-sbom@v0
+      - name: Upload SPDX SBOM artifact
+        uses: actions/upload-artifact@v4
         with:
-          sbom-artifact-match: ".*\\.spdx\\.json$"
+          name: sbom-spdx
+          path: sbom.spdx.json        # ← explicit file, not a directory
+          retention-days: 7
+
+      - name: Upload CycloneDX SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-cyclonedx
+          path: sbom.cyclonedx.json
+          retention-days: 7
 
 # ─────────────────────────────────────────────────────────────────────────────
 # JOB 6 — Vulnerability scan with Grype (from SBOM — no image pull needed)
@@ -300,19 +306,12 @@ jobs:
           name: sbom-spdx
           path: sbom-dir
 
-      - name: Show downloaded SBOM and resolve filename
+      - name: Show downloaded SBOM
         run: |
           echo "--- contents of sbom-dir ---"
           ls -lah sbom-dir/
-          # Find the spdx json regardless of exact filename
-          SBOM_FILE=$(find sbom-dir -name "*.json" | head -1)
-          if [ -z "$SBOM_FILE" ]; then
-            echo "ERROR: no JSON file found in sbom-dir"
-            exit 1
-          fi
-          echo "Found SBOM at: $SBOM_FILE"
-          echo "SBOM_PATH=$SBOM_FILE" >> "$GITHUB_ENV"
-          head -c 300 "$SBOM_FILE"
+          echo "--- SBOM head ---"
+          head -c 300 sbom-dir/sbom.spdx.json
 
       - name: Install Grype
         run: |
@@ -324,8 +323,7 @@ jobs:
         run: |
           set +e
 
-          echo "Scanning SBOM at: $SBOM_PATH"
-          grype "sbom:${SBOM_PATH}" \
+          grype "sbom:sbom-dir/sbom.spdx.json" \
             --output sarif \
             --file grype-results.sarif \
             --add-cpes-if-none \
