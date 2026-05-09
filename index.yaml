@@ -3,7 +3,28 @@ entries:
   no-latest-tag-webhook:
   - apiVersion: v2
     appVersion: 1.0.0
-    created: "2026-05-09T20:21:53.038600622Z"
+    created: "2026-05-09T20:29:48.176487315Z"
+    description: Kubernetes ValidatingAdmissionWebhook that blocks pods using :latest
+      or untagged container images
+    digest: 4f607fd445c13ae1b86e033da6616e305463bf5f827f648f4b96aefcc4a15eeb
+    keywords:
+    - webhook
+    - admission
+    - security
+    - image-policy
+    maintainers:
+    - name: omkar-shelke25
+      url: https://github.com/omkar-shelke25
+    name: no-latest-tag-webhook
+    sources:
+    - https://github.com/omkar-shelke25/admission-webhook-no-latest
+    type: application
+    urls:
+    - https://omkar-shelke25.github.io/admission-webhook-no-latest/no-latest-tag-webhook-1.0.13.tgz
+    version: 1.0.13
+  - apiVersion: v2
+    appVersion: 1.0.0
+    created: "2026-05-09T20:29:48.176000268Z"
     description: Kubernetes ValidatingAdmissionWebhook that blocks pods using :latest
       or untagged container images
     digest: 9955442e70b6d4a246b264316a6f948206f8e7bd973733c281f25196b6cd7f14
@@ -24,7 +45,7 @@ entries:
     version: 1.0.12
   - apiVersion: v2
     appVersion: 1.0.0
-    created: "2026-05-09T20:21:53.038105546Z"
+    created: "2026-05-09T20:29:48.175454817Z"
     description: Kubernetes ValidatingAdmissionWebhook that blocks pods using :latest
       or untagged container images
     digest: ddec29ad6b7595d6dd0dca4b4ddf2a573b6686fd84f3b0d0c0a2fa470166df08
@@ -45,7 +66,7 @@ entries:
     version: 1.0.11
   - apiVersion: v2
     appVersion: 1.0.0
-    created: "2026-05-09T20:21:53.037588146Z"
+    created: "2026-05-09T20:29:48.174972751Z"
     description: Kubernetes ValidatingAdmissionWebhook that blocks pods using :latest
       or untagged container images
     digest: 72e095d9d7f32cdbd3152810340a3d35f02283ddc04905f2102787391c872d34
@@ -66,7 +87,7 @@ entries:
     version: 1.0.10
   - apiVersion: v2
     appVersion: 1.0.0
-    created: "2026-05-09T20:21:53.039051983Z"
+    created: "2026-05-09T20:29:48.176927148Z"
     description: Kubernetes ValidatingAdmissionWebhook that blocks pods using :latest
       or untagged container images
     digest: 477d8e9edf34b916d3252e1e930a69a1ddd8210280413666ca1eb5d2da58e375
@@ -85,4 +106,4 @@ entries:
     urls:
     - https://omkar-shelke25.github.io/admission-webhook-no-latest/no-latest-tag-webhook-1.0.2.tgz
     version: 1.0.2
-generated: "2026-05-09T20:21:53.036867615Z"
+generated: "2026-05-09T20:29:48.174237878Z"
