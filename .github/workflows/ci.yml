@@ -12,7 +12,7 @@ on:
       - "*.txt"
       - ".gitignore"
       - ".gitattributes"
-      
+      - "helm/**/README.md"
   pull_request:
     branches: ["main"]
     paths-ignore:
@@ -23,6 +23,7 @@ on:
       - "*.txt"
       - ".gitignore"
       - ".gitattributes"
+      - "helm/**/README.md"
 
 env:
   IMAGE_NAME: ghcr.io/${{ github.repository }}
@@ -494,39 +495,67 @@ jobs:
       - name: Checkout main
         uses: actions/checkout@v4
         with:
-          ref: main          # pull the commit helm-update just pushed
+          ref: main
           token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 1
 
       - name: Set up Helm
         uses: azure/setup-helm@v4
         with:
           version: latest
 
+      # ── Step 1: confirm chart directory exists ──────────────────────────────
+      - name: Verify chart directory exists
+        run: |
+          set -e
+          echo "HELM_CHART_PATH = ${{ env.HELM_CHART_PATH }}"
+          echo ""
+          echo "=== Repo root ==="
+          ls -la
+          echo ""
+          echo "=== Chart dir ==="
+          ls -la ${{ env.HELM_CHART_PATH }}/
+          echo ""
+          echo "=== Chart.yaml ==="
+          cat ${{ env.HELM_CHART_PATH }}/Chart.yaml
+          echo ""
+          echo "=== templates/ ==="
+          ls -la ${{ env.HELM_CHART_PATH }}/templates/
+
+      # ── Step 2: lint before packaging ──────────────────────────────────────
+      - name: Lint Helm chart
+        run: |
+          set -e
+          helm lint ${{ env.HELM_CHART_PATH }} --strict
+          echo "Lint passed"
+
+      # ── Step 3: package ────────────────────────────────────────────────────
       - name: Package Helm chart
         id: package
         run: |
+          set -e
           mkdir -p .chart-output
 
-          helm dependency update ${{ env.HELM_CHART_PATH }} || true
-
+          echo "=== Packaging chart ==="
           helm package ${{ env.HELM_CHART_PATH }} \
-            --destination .chart-output
+            --destination .chart-output \
+            --debug
 
-          # Verify the .tgz was actually created
+          echo ""
+          echo "=== .chart-output after packaging ==="
+          ls -lah .chart-output/
+
           TGZ=$(ls .chart-output/*.tgz 2>/dev/null | head -1)
-          if [ -z "$TGZ" ]; then
-            echo "ERROR: helm package produced no .tgz file"
+          if [ -z "${TGZ}" ]; then
+            echo "ERROR: no .tgz found — helm package failed"
             exit 1
           fi
 
-          CHART_PKG=$(basename "$TGZ")
-          echo "Packaged: $CHART_PKG"
+          CHART_PKG=$(basename "${TGZ}")
           echo "chart-pkg=${CHART_PKG}" >> "$GITHUB_OUTPUT"
+          echo "Successfully packaged: ${CHART_PKG}"
 
-          echo "--- .chart-output contents ---"
-          ls -lah .chart-output/
-
-      # Upload BEFORE any git operations touch the workspace
+      # ── Step 4: upload artifact ─────────────────────────────────────────────
       - name: Upload chart package as artifact
         uses: actions/upload-artifact@v4
         with:
