@@ -76,4 +76,4 @@ Usage: {{ include "no-latest-tag-webhook.clusterIssuerName" . }}
 */}}
 {{- define "no-latest-tag-webhook.clusterIssuerName" -}}
 {{- printf "%s-selfsigned-issuer" (include "no-latest-tag-webhook.fullname" .) }}
-{{- end }}
+{{- end }}fix(helm): add missing fullname helper template
