@@ -23,7 +23,6 @@ on:
       - "*.txt"
       - ".gitignore"
       - ".gitattributes"
-      
 
 env:
   IMAGE_NAME: ghcr.io/${{ github.repository }}
@@ -464,112 +463,159 @@ jobs:
             git push
           fi
 
+
 # ─────────────────────────────────────────────────────────────────────────────
-# ─────────────────────────────────────────────────────────────────────────────
-# JOB 8 — Publish Helm Chart to GitHub Pages
+# JOB 8 — Package Helm chart and upload as artifact
 #
-# FIX: The .tgz is packaged on main branch then uploaded as an artifact.
-#      After switching to gh-pages, the artifact is downloaded back.
-#      This avoids the "not found" error caused by branch switching wiping
-#      the .chart-output/ directory from the workspace.
+# WHY a separate job from helm-publish-ghpages:
+#   A single job that does "helm package → git checkout gh-pages" wipes the
+#   workspace when switching branches, so .chart-output/*.tgz disappears
+#   before upload-artifact can find it.
+#   Splitting into two jobs gives each job its own fresh runner workspace —
+#   the artifact is the safe bridge between them.
 #
 # Flow:
-#   1. Checkout main  (has updated Chart.yaml + values.yaml from helm-update)
-#   2. helm package   → .chart-output/no-latest-tag-webhook-X.Y.Z.tgz
-#   3. Upload artifact (bridge across branch switch)
-#   4. Checkout gh-pages
-#   5. Download artifact → .tgz now available on gh-pages context
-#   6. helm repo index --merge  → update index.yaml
-#   7. git push gh-pages
+#   helm-update (values.yaml + Chart.yaml committed to main)
+#       └─► helm-package  (checkout main → helm package → upload artifact)
+#               └─► helm-publish-ghpages  (fresh runner → download artifact → push gh-pages)
 # ─────────────────────────────────────────────────────────────────────────────
-  helm-publish:
-    name: Publish Helm Chart to GitHub Pages
+  helm-package:
+    name: Package Helm Chart
     runs-on: ubuntu-latest
     needs: helm-update
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     permissions:
-      contents: write
+      contents: read
+
+    outputs:
+      chart-pkg: ${{ steps.package.outputs.chart-pkg }}
 
     steps:
-      # ── Step 1: checkout main with the tag-injected Chart.yaml ──────────────
       - name: Checkout main
         uses: actions/checkout@v4
         with:
-          ref: main                    # exact commit helm-update just pushed
+          ref: main          # pull the commit helm-update just pushed
           token: ${{ secrets.GITHUB_TOKEN }}
-          fetch-depth: 0               # full history — required for branch ops
 
-      # ── Step 2: install helm ─────────────────────────────────────────────────
       - name: Set up Helm
         uses: azure/setup-helm@v4
         with:
           version: latest
 
-      # ── Step 3: package the chart WHILE still on main ───────────────────────
-      - name: Package Helm chart (on main branch)
+      - name: Package Helm chart
+        id: package
         run: |
           mkdir -p .chart-output
 
-          # update dependencies if any declared in Chart.yaml
           helm dependency update ${{ env.HELM_CHART_PATH }} || true
 
-          helm package ${{ env.HELM_CHART_PATH }} --destination .chart-output
+          helm package ${{ env.HELM_CHART_PATH }} \
+            --destination .chart-output
 
-          echo "--- Packaged ---"
+          # Verify the .tgz was actually created
+          TGZ=$(ls .chart-output/*.tgz 2>/dev/null | head -1)
+          if [ -z "$TGZ" ]; then
+            echo "ERROR: helm package produced no .tgz file"
+            exit 1
+          fi
+
+          CHART_PKG=$(basename "$TGZ")
+          echo "Packaged: $CHART_PKG"
+          echo "chart-pkg=${CHART_PKG}" >> "$GITHUB_OUTPUT"
+
+          echo "--- .chart-output contents ---"
           ls -lah .chart-output/
 
-          # export filename for later steps
-          CHART_PKG=$(ls .chart-output/*.tgz | xargs basename)
-          echo "CHART_PKG=${CHART_PKG}" >> "$GITHUB_ENV"
-
-      # ── Step 4: upload .tgz as artifact BEFORE switching branches ───────────
-      # This is the key fix — the artifact survives the git checkout below.
+      # Upload BEFORE any git operations touch the workspace
       - name: Upload chart package as artifact
         uses: actions/upload-artifact@v4
         with:
           name: helm-chart-package
           path: .chart-output/*.tgz
-          retention-days: 1            # short-lived — only needed within this run
+          retention-days: 1
           if-no-files-found: error
 
-      # ── Step 5: switch to gh-pages (or create it) ───────────────────────────
-      - name: Checkout or create gh-pages branch
-        run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+# ─────────────────────────────────────────────────────────────────────────────
+# JOB 9 — Publish packaged chart to gh-pages
+#
+# Fresh runner workspace — no risk of branch switch wiping the .tgz.
+# Downloads the artifact from JOB 8, checks out gh-pages, updates index.yaml.
+# ─────────────────────────────────────────────────────────────────────────────
+  helm-publish-ghpages:
+    name: Publish Helm Chart to GitHub Pages
+    runs-on: ubuntu-latest
+    needs: helm-package
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: write
 
-          if git ls-remote --exit-code origin gh-pages; then
-            echo "gh-pages exists — checking out"
-            git checkout gh-pages
-            git pull origin gh-pages
-          else
-            echo "gh-pages not found — creating orphan branch"
-            git checkout --orphan gh-pages
-            git rm -rf .
-            echo "# Helm Chart Repository" > README.md
-            git add README.md
-            git commit -m "chore: initialise gh-pages branch"
-            git push origin gh-pages
-          fi
-
-      # ── Step 6: download the .tgz into the gh-pages workspace ───────────────
+    steps:
+      # Download artifact into this job's fresh workspace FIRST
+      # No git operations have touched the workspace yet — safe.
       - name: Download chart package artifact
         uses: actions/download-artifact@v4
         with:
           name: helm-chart-package
-          path: .                      # download directly into gh-pages root
+          path: /tmp/chart-output
 
-      - name: Verify .tgz is present on gh-pages
+      - name: Verify .tgz downloaded correctly
         run: |
-          echo "--- Files in gh-pages root ---"
-          ls -lah *.tgz
-          echo "Chart package: ${{ env.CHART_PKG }}"
+          echo "--- Downloaded artifact ---"
+          ls -lah /tmp/chart-output/
+          if [ -z "$(ls /tmp/chart-output/*.tgz 2>/dev/null)" ]; then
+            echo "ERROR: no .tgz found in artifact"
+            exit 1
+          fi
 
-      # ── Step 7: rebuild index.yaml, merging with existing entries ───────────
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: latest
+
+      # Checkout gh-pages into a subdirectory so it never touches /tmp/chart-output
+      - name: Checkout or create gh-pages branch
+        uses: actions/checkout@v4
+        with:
+          ref: gh-pages
+          token: ${{ secrets.GITHUB_TOKEN }}
+          path: gh-pages-dir        # checkout into subdir — keeps workspace clean
+        continue-on-error: true     # fails gracefully if gh-pages doesn't exist yet
+
+      - name: Create gh-pages branch if it does not exist
+        run: |
+          if [ ! -d "gh-pages-dir/.git" ]; then
+            echo "gh-pages branch not found — creating it"
+            git clone \
+              --branch main \
+              --depth 1 \
+              "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" \
+              gh-pages-dir
+
+            cd gh-pages-dir
+            git checkout --orphan gh-pages
+            git rm -rf .
+            echo "# Helm Chart Repository" > README.md
+            git config user.name  "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add README.md
+            git commit -m "chore: initialise gh-pages branch"
+            git push origin gh-pages
+          else
+            echo "gh-pages branch exists"
+          fi
+
+      - name: Copy .tgz into gh-pages dir
+        run: |
+          cp /tmp/chart-output/*.tgz gh-pages-dir/
+          echo "--- gh-pages-dir contents ---"
+          ls -lah gh-pages-dir/
+
       - name: Update Helm repo index
         run: |
           PAGES_URL="https://${{ github.repository_owner }}.github.io/$(echo '${{ github.repository }}' | cut -d'/' -f2)"
           echo "Repo URL: ${PAGES_URL}"
+
+          cd gh-pages-dir
 
           if [ -f index.yaml ]; then
             echo "Merging into existing index.yaml"
@@ -582,26 +628,30 @@ jobs:
           echo "--- index.yaml ---"
           cat index.yaml
 
-      # ── Step 8: commit + push gh-pages ──────────────────────────────────────
       - name: Commit and push to gh-pages
         run: |
+          cd gh-pages-dir
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
           git add *.tgz index.yaml
 
           if git diff --cached --quiet; then
             echo "No changes to publish — skipping."
           else
-            git commit -m "chore(helm-publish): release ${{ env.CHART_PKG }}"
+            git commit -m "chore(helm-publish): release ${{ needs.helm-package.outputs.chart-pkg }}"
             git push origin gh-pages
-            echo "✅ Published ${{ env.CHART_PKG }} to gh-pages"
+            echo "✅ Published ${{ needs.helm-package.outputs.chart-pkg }} to gh-pages"
           fi
 
-      # ── Step 9: print install instructions ──────────────────────────────────
       - name: Print install instructions
         run: |
           PAGES_URL="https://${{ github.repository_owner }}.github.io/$(echo '${{ github.repository }}' | cut -d'/' -f2)"
           echo ""
           echo "════════════════════════════════════════════════"
-          echo "  Helm chart published!"
+          echo "  Helm chart published to GitHub Pages!"
+          echo "  Chart: ${{ needs.helm-package.outputs.chart-pkg }}"
           echo "════════════════════════════════════════════════"
           echo "  Add repo:"
           echo "    helm repo add no-latest-tag ${PAGES_URL}"
