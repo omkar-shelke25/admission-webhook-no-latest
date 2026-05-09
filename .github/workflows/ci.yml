@@ -9,10 +9,9 @@ on:
       - ".github/ISSUE_TEMPLATE/**"
       - ".github/PULL_REQUEST_TEMPLATE/**"
       - "docs/**"
-      - "*.txt"
       - ".gitignore"
       - ".gitattributes"
-      - "helm/**/README.md"
+
   pull_request:
     branches: ["main"]
     paths-ignore:
@@ -20,7 +19,6 @@ on:
       - ".github/ISSUE_TEMPLATE/**"
       - ".github/PULL_REQUEST_TEMPLATE/**"
       - "docs/**"
-      - "*.txt"
       - ".gitignore"
       - ".gitattributes"
 
@@ -29,28 +27,12 @@ env:
   GO_VERSION: "1.26"
   HELM_CHART_PATH: no-latest-tag-webhook
 
-# ─── Pipeline flow ────────────────────────────────────────────────────────────
-#
-#  test
-#    └─► build
-#           ├─► sign        (main only)
-#           ├─► trivy
-#           └─► sbom
-#                 └─► grype
-#                       └─► helm-update  ← tag injected LAST, after ALL scans pass
-#
-# ─────────────────────────────────────────────────────────────────────────────
-
 jobs:
-# ─────────────────────────────────────────────────────────────────────────────
-# JOB 1 — Unit tests + coverage
-# ─────────────────────────────────────────────────────────────────────────────
   test:
     name: Unit Tests
     runs-on: ubuntu-latest
     permissions:
       contents: read
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -91,9 +73,6 @@ jobs:
           retention-days: 30
           if-no-files-found: error
 
-# ─────────────────────────────────────────────────────────────────────────────
-# JOB 2 — Docker build + push to GHCR
-# ─────────────────────────────────────────────────────────────────────────────
   build:
     name: Build & Push Image
     runs-on: ubuntu-latest
@@ -101,12 +80,10 @@ jobs:
     permissions:
       contents: read
       packages: write
-
     outputs:
       image-ref:    ${{ steps.image-ref.outputs.value }}
       image-digest: ${{ steps.push.outputs.digest }}
       image-tag:    ${{ steps.image-tag.outputs.value }}
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -165,9 +142,6 @@ jobs:
           SHA_SHORT=$(echo "${{ github.sha }}" | cut -c1-7)
           echo "value=${{ env.IMAGE_NAME }}:sha-${SHA_SHORT}" >> "$GITHUB_OUTPUT"
 
-# ─────────────────────────────────────────────────────────────────────────────
-# JOB 3 — Cosign image signing (runs in parallel with trivy/sbom)
-# ─────────────────────────────────────────────────────────────────────────────
   sign:
     name: Sign Image (Cosign)
     runs-on: ubuntu-latest
@@ -177,7 +151,6 @@ jobs:
       contents: read
       packages: write
       id-token: write
-
     steps:
       - name: Install Cosign
         uses: sigstore/cosign-installer@v3
@@ -201,9 +174,6 @@ jobs:
             --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
             "${{ env.IMAGE_NAME }}@${{ needs.build.outputs.image-digest }}"
 
-# ─────────────────────────────────────────────────────────────────────────────
-# JOB 4 — Trivy vulnerability scan (runs in parallel with sbom/sign)
-# ─────────────────────────────────────────────────────────────────────────────
   trivy:
     name: Vulnerability Scan (Trivy)
     runs-on: ubuntu-latest
@@ -211,7 +181,6 @@ jobs:
     permissions:
       contents: read
       security-events: write
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -249,9 +218,6 @@ jobs:
           retention-days: 30
           if-no-files-found: warn
 
-# ─────────────────────────────────────────────────────────────────────────────
-# JOB 5 — SBOM generation with Syft (runs in parallel with trivy/sign)
-# ─────────────────────────────────────────────────────────────────────────────
   sbom:
     name: Generate SBOM (Syft)
     runs-on: ubuntu-latest
@@ -259,10 +225,8 @@ jobs:
     permissions:
       contents: read
       packages: write
-
     outputs:
       sbom-artifact-name: sbom-spdx
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -325,18 +289,13 @@ jobs:
         with:
           sbom-artifact-match: ".*\\.spdx\\.json$"
 
-# ─────────────────────────────────────────────────────────────────────────────
-# JOB 6 — Grype scan from SBOM
-# needs: sbom — runs AFTER sbom, feeds into helm-update
-# ─────────────────────────────────────────────────────────────────────────────
   grype:
     name: Vulnerability Scan (Grype via SBOM)
     runs-on: ubuntu-latest
-    needs: sbom                          # ← waits for sbom to finish
+    needs: sbom
     permissions:
       contents: read
       security-events: write
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -396,28 +355,13 @@ jobs:
           retention-days: 30
           if-no-files-found: warn
 
-# ─────────────────────────────────────────────────────────────────────────────
-# JOB 7 — Helm tag injection (LAST — only after grype + trivy + sign all pass)
-#
-# needs: [grype, trivy, sign]
-#   grype  → already waited for sbom → already waited for build
-#   trivy  → already waited for build
-#   sign   → already waited for build
-#
-# This means helm-update only runs when the full chain is green:
-#   test → build → sign ✅
-#                → trivy ✅
-#                → sbom → grype ✅
-#                              └─► helm-update runs here
-# ─────────────────────────────────────────────────────────────────────────────
   helm-update:
     name: Update Helm Chart Image Tag
     runs-on: ubuntu-latest
-    needs: [grype, trivy, sign]          # ← waits for ALL three to succeed
+    needs: [grype, trivy, sign]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     permissions:
       contents: write
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -428,11 +372,8 @@ jobs:
         run: |
           NEW_TAG="${{ needs.build.outputs.image-tag }}"
           VALUES_FILE="${{ env.HELM_CHART_PATH }}/values.yaml"
-
           echo "Injecting image.tag: ${NEW_TAG} into ${VALUES_FILE}"
-
           sed -i "s|^\(\s*tag:\s*\)\"sha-[a-f0-9]*\"|\1\"${NEW_TAG}\"|" "${VALUES_FILE}"
-
           echo "--- Updated image block ---"
           grep -A4 "^image:" "${VALUES_FILE}"
 
@@ -451,14 +392,216 @@ jobs:
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-
           git add \
             "${{ env.HELM_CHART_PATH }}/values.yaml" \
             "${{ env.HELM_CHART_PATH }}/Chart.yaml"
-
           if git diff --cached --quiet; then
             echo "No helm changes to commit — skipping."
           else
             git commit -m "chore(helm): update image.tag to ${{ needs.build.outputs.image-tag }} [skip ci]"
             git push
           fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# JOB 8 — Package Helm chart and upload as artifact
+#
+# ROOT CAUSE FIX:
+#   The .tgz was being created successfully every time.
+#   upload-artifact@v4 does NOT expand ${{ github.workspace }} or ${{ env.* }}
+#   in the path: field — it treats them as literal strings, so the glob fails.
+#
+#   Fix: package into /tmp, copy .tgz to workspace root, upload with plain
+#   "*.tgz" — a simple relative glob that always works, no expressions needed.
+# ─────────────────────────────────────────────────────────────────────────────
+  helm-package:
+    name: Package Helm Chart
+    runs-on: ubuntu-latest
+    needs: helm-update
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+    outputs:
+      chart-pkg: ${{ steps.package.outputs.chart-pkg }}
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Pull latest main
+        run: git pull origin main
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: latest
+
+      - name: Verify chart directory exists
+        run: |
+          set -e
+          echo "=== Chart.yaml ==="
+          cat ${{ env.HELM_CHART_PATH }}/Chart.yaml
+          echo "=== templates/ ==="
+          ls -la ${{ env.HELM_CHART_PATH }}/templates/
+
+      - name: Lint Helm chart
+        run: |
+          set -e
+          helm lint ${{ env.HELM_CHART_PATH }} --strict
+          echo "Lint passed"
+
+      - name: Package Helm chart
+        id: package
+        run: |
+          set -e
+
+          # Package into /tmp — completely outside workspace, zero path issues
+          mkdir -p /tmp/chart-out
+          helm package ${{ env.HELM_CHART_PATH }} \
+            --destination /tmp/chart-out \
+            --debug
+
+          echo "=== /tmp/chart-out contents ==="
+          ls -lah /tmp/chart-out/
+
+          TGZ=$(ls /tmp/chart-out/*.tgz 2>/dev/null | head -1)
+          if [ -z "${TGZ}" ]; then
+            echo "ERROR: no .tgz found — helm package failed"
+            exit 1
+          fi
+
+          CHART_PKG=$(basename "${TGZ}")
+          echo "chart-pkg=${CHART_PKG}" >> "$GITHUB_OUTPUT"
+          echo "Successfully packaged: ${CHART_PKG}"
+
+          # Copy to workspace root so upload-artifact can use a plain glob
+          cp "/tmp/chart-out/${CHART_PKG}" .
+          echo "Copied ${CHART_PKG} to workspace root"
+          ls -lah ./*.tgz
+
+      # path: "*.tgz" — plain relative glob, no ${{ }} expressions.
+      # This is the fix. upload-artifact@v4 does not expand context expressions
+      # in the path field; a simple glob always works.
+      - name: Upload chart package as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: helm-chart-package
+          path: "*.tgz"
+          retention-days: 1
+          if-no-files-found: error
+
+  helm-publish-ghpages:
+    name: Publish Helm Chart to GitHub Pages
+    runs-on: ubuntu-latest
+    needs: helm-package
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: write
+    steps:
+      - name: Download chart package artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: helm-chart-package
+          path: /tmp/chart-output
+
+      - name: Verify .tgz downloaded correctly
+        run: |
+          echo "--- Downloaded artifact ---"
+          ls -lah /tmp/chart-output/
+          if [ -z "$(ls /tmp/chart-output/*.tgz 2>/dev/null)" ]; then
+            echo "ERROR: no .tgz found in artifact"
+            exit 1
+          fi
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: latest
+
+      - name: Checkout or create gh-pages branch
+        uses: actions/checkout@v4
+        with:
+          ref: gh-pages
+          token: ${{ secrets.GITHUB_TOKEN }}
+          path: gh-pages-dir
+        continue-on-error: true
+
+      - name: Create gh-pages branch if it does not exist
+        run: |
+          if [ ! -d "gh-pages-dir/.git" ]; then
+            echo "gh-pages branch not found — creating it"
+            git clone \
+              --branch main \
+              --depth 1 \
+              "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" \
+              gh-pages-dir
+            cd gh-pages-dir
+            git checkout --orphan gh-pages
+            git rm -rf .
+            echo "# Helm Chart Repository" > README.md
+            git config user.name  "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add README.md
+            git commit -m "chore: initialise gh-pages branch"
+            git push origin gh-pages
+          else
+            echo "gh-pages branch exists"
+          fi
+
+      - name: Copy .tgz into gh-pages dir
+        run: |
+          cp /tmp/chart-output/*.tgz gh-pages-dir/
+          echo "--- gh-pages-dir contents ---"
+          ls -lah gh-pages-dir/
+
+      - name: Update Helm repo index
+        run: |
+          PAGES_URL="https://${{ github.repository_owner }}.github.io/$(echo '${{ github.repository }}' | cut -d'/' -f2)"
+          echo "Repo URL: ${PAGES_URL}"
+          cd gh-pages-dir
+          if [ -f index.yaml ]; then
+            echo "Merging into existing index.yaml"
+            helm repo index . --url "${PAGES_URL}" --merge index.yaml
+          else
+            echo "Creating new index.yaml"
+            helm repo index . --url "${PAGES_URL}"
+          fi
+          echo "--- index.yaml ---"
+          cat index.yaml
+
+      - name: Commit and push to gh-pages
+        run: |
+          cd gh-pages-dir
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add *.tgz index.yaml
+          if git diff --cached --quiet; then
+            echo "No changes to publish — skipping."
+          else
+            git commit -m "chore(helm-publish): release ${{ needs.helm-package.outputs.chart-pkg }}"
+            git push origin gh-pages
+            echo "✅ Published ${{ needs.helm-package.outputs.chart-pkg }} to gh-pages"
+          fi
+
+      - name: Print install instructions
+        run: |
+          PAGES_URL="https://${{ github.repository_owner }}.github.io/$(echo '${{ github.repository }}' | cut -d'/' -f2)"
+          echo ""
+          echo "════════════════════════════════════════════════"
+          echo "  Helm chart published to GitHub Pages!"
+          echo "  Chart: ${{ needs.helm-package.outputs.chart-pkg }}"
+          echo "════════════════════════════════════════════════"
+          echo "  Add repo:"
+          echo "    helm repo add no-latest-tag ${PAGES_URL}"
+          echo "    helm repo update"
+          echo ""
+          echo "  Install:"
+          echo "    helm install no-latest-tag no-latest-tag/no-latest-tag-webhook \\"
+          echo "      -n webhook-system --create-namespace"
+          echo ""
+          echo "  Verify:"
+          echo "    helm search repo no-latest-tag"
+          echo "    curl ${PAGES_URL}/index.yaml"
+          echo "════════════════════════════════════════════════"
