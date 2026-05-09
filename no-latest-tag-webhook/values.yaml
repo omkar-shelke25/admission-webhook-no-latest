@@ -1,0 +1,123 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# no-latest-tag-webhook — default values
+# Override any value with: helm install ... --set key=value
+#                      or: helm install ... -f my-values.yaml
+# ──────────────────────────────────────────────────────────────────────────────
+
+# -- Number of webhook replicas
+replicaCount: 2
+
+image:
+  # -- Container image repository
+  repository: ghcr.io/omkar-shelke25/admission-webhook-no-latest
+  # -- Image pull policy
+  pullPolicy: IfNotPresent
+  # -- Image tag (overrides appVersion if set)
+  tag: "sha-54ef307"
+
+# -- Image pull secrets for private registries
+imagePullSecrets: []
+
+# -- Override the chart name
+nameOverride: ""
+# -- Override the full release name
+fullnameOverride: ""
+
+# ── Webhook server config ──────────────────────────────────────────────────────
+webhook:
+  # -- Port the webhook server listens on (must match containerPort and service)
+  port: 8443
+  # -- Path to the TLS certificate inside the container
+  certPath: /etc/webhook/certs/tls.crt
+  # -- Path to the TLS private key inside the container
+  keyPath: /etc/webhook/certs/tls.key
+
+# ── cert-manager integration ───────────────────────────────────────────────────
+certManager:
+  # -- Enable cert-manager Certificate + ClusterIssuer creation
+  enabled: true
+  # -- Certificate duration
+  duration: 8760h       # 1 year
+  # -- Renew this long before expiry
+  renewBefore: 720h     # 30 days
+
+# ── Namespace selector for the ValidatingWebhookConfiguration ─────────────────
+namespaceSelector:
+  # -- Namespaces to EXCLUDE from webhook enforcement
+  # kube-system and kube-public are required to avoid breaking cluster components.
+  # webhook-system is required to avoid deadlocking the webhook itself.
+  excludedNamespaces:
+    - kube-system
+    - kube-public
+    - webhook-system
+
+# ── Webhook behaviour ──────────────────────────────────────────────────────────
+admissionWebhook:
+  # -- Fail = block pod if webhook is unreachable (safe)
+  # -- Ignore = allow pod if webhook is unreachable (unsafe but avoids outages)
+  failurePolicy: Fail
+  # -- Timeout in seconds for the webhook call
+  timeoutSeconds: 5
+
+# ── Service ───────────────────────────────────────────────────────────────────
+service:
+  type: ClusterIP
+  port: 443
+  targetPort: 8443
+
+# ── Security contexts ─────────────────────────────────────────────────────────
+podSecurityContext:
+  runAsNonRoot: true
+  # 65532 = numeric UID of "nonroot" in distroless images.
+  # Kubernetes requires a numeric UID for runAsNonRoot verification.
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  capabilities:
+    drop: ["ALL"]
+
+# ── Resources ─────────────────────────────────────────────────────────────────
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 200m
+    memory: 128Mi
+
+# ── Probes ────────────────────────────────────────────────────────────────────
+livenessProbe:
+  initialDelaySeconds: 5
+  periodSeconds: 10
+
+readinessProbe:
+  initialDelaySeconds: 3
+  periodSeconds: 5
+
+# ── Node scheduling ───────────────────────────────────────────────────────────
+nodeSelector: {}
+
+tolerations: []
+
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: no-latest-tag-webhook
+          topologyKey: kubernetes.io/hostname
+
+# ── Extra labels and annotations ──────────────────────────────────────────────
+podAnnotations: {}
+podLabels: {}
