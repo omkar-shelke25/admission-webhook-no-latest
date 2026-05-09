@@ -358,7 +358,7 @@ jobs:
   helm-update:
     name: Update Helm Chart Image Tag
     runs-on: ubuntu-latest
-    needs: [grype, trivy, sign]
+    needs: [build, grype, trivy, sign]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     permissions:
       contents: write
