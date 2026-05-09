@@ -12,7 +12,7 @@ on:
       - "*.txt"
       - ".gitignore"
       - ".gitattributes"
-      - "helm/**/README.md"
+      
   pull_request:
     branches: ["main"]
     paths-ignore:
@@ -23,6 +23,7 @@ on:
       - "*.txt"
       - ".gitignore"
       - ".gitattributes"
+      
 
 env:
   IMAGE_NAME: ghcr.io/${{ github.repository }}
@@ -464,109 +465,143 @@ jobs:
           fi
 
 # ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # JOB 8 — Publish Helm Chart to GitHub Pages
 #
+# FIX: The .tgz is packaged on main branch then uploaded as an artifact.
+#      After switching to gh-pages, the artifact is downloaded back.
+#      This avoids the "not found" error caused by branch switching wiping
+#      the .chart-output/ directory from the workspace.
+#
 # Flow:
-#   helm-update (tag injected + Chart.yaml version bumped)
-#       └─► helm-publish (packages chart → pushes to gh-pages branch)
-#
-# GitHub Pages setup (one-time, do this first):
-#   Repo → Settings → Pages → Source: Deploy from branch → Branch: gh-pages / root
-#
-# After this job runs, your chart is installable via:
-#   helm repo add no-latest-tag https://<your-user>.github.io/<repo-name>
-#   helm install no-latest-tag no-latest-tag/no-latest-tag-webhook
+#   1. Checkout main  (has updated Chart.yaml + values.yaml from helm-update)
+#   2. helm package   → .chart-output/no-latest-tag-webhook-X.Y.Z.tgz
+#   3. Upload artifact (bridge across branch switch)
+#   4. Checkout gh-pages
+#   5. Download artifact → .tgz now available on gh-pages context
+#   6. helm repo index --merge  → update index.yaml
+#   7. git push gh-pages
 # ─────────────────────────────────────────────────────────────────────────────
   helm-publish:
     name: Publish Helm Chart to GitHub Pages
     runs-on: ubuntu-latest
-    needs: helm-update                   # ← strictly after tag is injected
+    needs: helm-update
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     permissions:
-      contents: write                    # needed to push to gh-pages branch
+      contents: write
 
     steps:
-      - name: Checkout main (has updated Chart.yaml + values.yaml)
+      # ── Step 1: checkout main with the tag-injected Chart.yaml ──────────────
+      - name: Checkout main
         uses: actions/checkout@v4
         with:
-          ref: main                      # pull the commit helm-update just pushed
+          ref: main                    # exact commit helm-update just pushed
           token: ${{ secrets.GITHUB_TOKEN }}
-          fetch-depth: 0                 # full history needed for gh-pages branch ops
+          fetch-depth: 0               # full history — required for branch ops
 
+      # ── Step 2: install helm ─────────────────────────────────────────────────
       - name: Set up Helm
         uses: azure/setup-helm@v4
         with:
           version: latest
 
-      - name: Package Helm chart
+      # ── Step 3: package the chart WHILE still on main ───────────────────────
+      - name: Package Helm chart (on main branch)
         run: |
           mkdir -p .chart-output
+
+          # update dependencies if any declared in Chart.yaml
           helm dependency update ${{ env.HELM_CHART_PATH }} || true
+
           helm package ${{ env.HELM_CHART_PATH }} --destination .chart-output
-          echo "--- Packaged chart ---"
+
+          echo "--- Packaged ---"
           ls -lah .chart-output/
 
+          # export filename for later steps
+          CHART_PKG=$(ls .chart-output/*.tgz | xargs basename)
+          echo "CHART_PKG=${CHART_PKG}" >> "$GITHUB_ENV"
+
+      # ── Step 4: upload .tgz as artifact BEFORE switching branches ───────────
+      # This is the key fix — the artifact survives the git checkout below.
+      - name: Upload chart package as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: helm-chart-package
+          path: .chart-output/*.tgz
+          retention-days: 1            # short-lived — only needed within this run
+          if-no-files-found: error
+
+      # ── Step 5: switch to gh-pages (or create it) ───────────────────────────
       - name: Checkout or create gh-pages branch
         run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
           if git ls-remote --exit-code origin gh-pages; then
+            echo "gh-pages exists — checking out"
             git checkout gh-pages
             git pull origin gh-pages
           else
-            echo "gh-pages branch not found — creating orphan branch"
+            echo "gh-pages not found — creating orphan branch"
             git checkout --orphan gh-pages
             git rm -rf .
             echo "# Helm Chart Repository" > README.md
-            git config user.name  "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
             git add README.md
             git commit -m "chore: initialise gh-pages branch"
             git push origin gh-pages
-            git checkout main
-            git checkout gh-pages
           fi
 
-      - name: Copy packaged chart to gh-pages
-        run: |
-          cp .chart-output/*.tgz .
-          echo "--- Charts on gh-pages ---"
-          ls -lah *.tgz
+      # ── Step 6: download the .tgz into the gh-pages workspace ───────────────
+      - name: Download chart package artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: helm-chart-package
+          path: .                      # download directly into gh-pages root
 
+      - name: Verify .tgz is present on gh-pages
+        run: |
+          echo "--- Files in gh-pages root ---"
+          ls -lah *.tgz
+          echo "Chart package: ${{ env.CHART_PKG }}"
+
+      # ── Step 7: rebuild index.yaml, merging with existing entries ───────────
       - name: Update Helm repo index
         run: |
           PAGES_URL="https://${{ github.repository_owner }}.github.io/$(echo '${{ github.repository }}' | cut -d'/' -f2)"
-          echo "Chart repo URL: ${PAGES_URL}"
+          echo "Repo URL: ${PAGES_URL}"
 
-          # --merge keeps ALL previous chart versions in index.yaml
           if [ -f index.yaml ]; then
+            echo "Merging into existing index.yaml"
             helm repo index . --url "${PAGES_URL}" --merge index.yaml
           else
+            echo "Creating new index.yaml"
             helm repo index . --url "${PAGES_URL}"
           fi
 
           echo "--- index.yaml ---"
           cat index.yaml
 
+      # ── Step 8: commit + push gh-pages ──────────────────────────────────────
       - name: Commit and push to gh-pages
         run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
           git add *.tgz index.yaml
 
           if git diff --cached --quiet; then
-            echo "No chart changes to publish — skipping."
+            echo "No changes to publish — skipping."
           else
-            CHART_PKG=$(ls .chart-output/*.tgz | xargs basename)
-            git commit -m "chore(helm-publish): release ${CHART_PKG}"
+            git commit -m "chore(helm-publish): release ${{ env.CHART_PKG }}"
             git push origin gh-pages
+            echo "✅ Published ${{ env.CHART_PKG }} to gh-pages"
           fi
 
+      # ── Step 9: print install instructions ──────────────────────────────────
       - name: Print install instructions
         run: |
           PAGES_URL="https://${{ github.repository_owner }}.github.io/$(echo '${{ github.repository }}' | cut -d'/' -f2)"
           echo ""
           echo "════════════════════════════════════════════════"
-          echo "  Helm chart published to GitHub Pages!"
+          echo "  Helm chart published!"
           echo "════════════════════════════════════════════════"
           echo "  Add repo:"
           echo "    helm repo add no-latest-tag ${PAGES_URL}"
@@ -576,5 +611,7 @@ jobs:
           echo "    helm install no-latest-tag no-latest-tag/no-latest-tag-webhook \\"
           echo "      -n webhook-system --create-namespace"
           echo ""
-          echo "  Index URL: ${PAGES_URL}/index.yaml"
+          echo "  Verify:"
+          echo "    helm search repo no-latest-tag"
+          echo "    curl ${PAGES_URL}/index.yaml"
           echo "════════════════════════════════════════════════"
