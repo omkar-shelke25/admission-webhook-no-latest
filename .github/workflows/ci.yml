@@ -9,10 +9,9 @@ on:
       - ".github/ISSUE_TEMPLATE/**"
       - ".github/PULL_REQUEST_TEMPLATE/**"
       - "docs/**"
-      
       - ".gitignore"
       - ".gitattributes"
-      
+
   pull_request:
     branches: ["main"]
     paths-ignore:
@@ -22,7 +21,6 @@ on:
       - "docs/**"
       - ".gitignore"
       - ".gitattributes"
-      
 
 env:
   IMAGE_NAME: ghcr.io/${{ github.repository }}
@@ -38,6 +36,8 @@ env:
 #           └─► sbom
 #                 └─► grype
 #                       └─► helm-update  ← tag injected LAST, after ALL scans pass
+#                               └─► helm-package
+#                                       └─► helm-publish-ghpages
 #
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -327,12 +327,11 @@ jobs:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # JOB 6 — Grype scan from SBOM
-# needs: sbom — runs AFTER sbom, feeds into helm-update
 # ─────────────────────────────────────────────────────────────────────────────
   grype:
     name: Vulnerability Scan (Grype via SBOM)
     runs-on: ubuntu-latest
-    needs: sbom                          # ← waits for sbom to finish
+    needs: sbom
     permissions:
       contents: read
       security-events: write
@@ -398,22 +397,11 @@ jobs:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # JOB 7 — Helm tag injection (LAST — only after grype + trivy + sign all pass)
-#
-# needs: [grype, trivy, sign]
-#   grype  → already waited for sbom → already waited for build
-#   trivy  → already waited for build
-#   sign   → already waited for build
-#
-# This means helm-update only runs when the full chain is green:
-#   test → build → sign ✅
-#                → trivy ✅
-#                → sbom → grype ✅
-#                              └─► helm-update runs here
 # ─────────────────────────────────────────────────────────────────────────────
   helm-update:
     name: Update Helm Chart Image Tag
     runs-on: ubuntu-latest
-    needs: [grype, trivy, sign]          # ← waits for ALL three to succeed
+    needs: [grype, trivy, sign]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     permissions:
       contents: write
@@ -463,21 +451,8 @@ jobs:
             git push
           fi
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # JOB 8 — Package Helm chart and upload as artifact
-#
-# WHY a separate job from helm-publish-ghpages:
-#   A single job that does "helm package → git checkout gh-pages" wipes the
-#   workspace when switching branches, so .chart-output/*.tgz disappears
-#   before upload-artifact can find it.
-#   Splitting into two jobs gives each job its own fresh runner workspace —
-#   the artifact is the safe bridge between them.
-#
-# Flow:
-#   helm-update (values.yaml + Chart.yaml committed to main)
-#       └─► helm-package  (checkout main → helm package → upload artifact)
-#               └─► helm-publish-ghpages  (fresh runner → download artifact → push gh-pages)
 # ─────────────────────────────────────────────────────────────────────────────
   helm-package:
     name: Package Helm Chart
@@ -491,12 +466,20 @@ jobs:
       chart-pkg: ${{ steps.package.outputs.chart-pkg }}
 
     steps:
+      # FIX 1: fetch-depth: 0 ensures the helm-update commit is included.
+      # Without this, a shallow clone may check out the commit BEFORE
+      # helm-update pushed the bumped Chart.yaml / values.yaml.
       - name: Checkout main
         uses: actions/checkout@v4
         with:
           ref: main
           token: ${{ secrets.GITHUB_TOKEN }}
-          fetch-depth: 1
+          fetch-depth: 0            # ← was 1; 0 = full history, gets helm-update commit
+
+      # FIX 2: Explicit pull guarantees we are on the very latest commit on main,
+      # not just whatever SHA actions/checkout resolved at job-queue time.
+      - name: Pull latest main
+        run: git pull origin main
 
       - name: Set up Helm
         uses: azure/setup-helm@v4
@@ -533,18 +516,18 @@ jobs:
         id: package
         run: |
           set -e
-          mkdir -p .chart-output
+          mkdir -p "$GITHUB_WORKSPACE/.chart-output"
 
           echo "=== Packaging chart ==="
           helm package ${{ env.HELM_CHART_PATH }} \
-            --destination .chart-output \
+            --destination "$GITHUB_WORKSPACE/.chart-output" \
             --debug
 
           echo ""
           echo "=== .chart-output after packaging ==="
-          ls -lah .chart-output/
+          ls -lah "$GITHUB_WORKSPACE/.chart-output/"
 
-          TGZ=$(ls .chart-output/*.tgz 2>/dev/null | head -1)
+          TGZ=$(ls "$GITHUB_WORKSPACE/.chart-output/"*.tgz 2>/dev/null | head -1)
           if [ -z "${TGZ}" ]; then
             echo "ERROR: no .tgz found — helm package failed"
             exit 1
@@ -555,19 +538,19 @@ jobs:
           echo "Successfully packaged: ${CHART_PKG}"
 
       # ── Step 4: upload artifact ─────────────────────────────────────────────
+      # FIX 3: Use ${{ github.workspace }} (absolute path) instead of the
+      # relative .chart-output/*.tgz — eliminates any working-directory
+      # ambiguity between the run step and the upload-artifact action.
       - name: Upload chart package as artifact
         uses: actions/upload-artifact@v4
         with:
           name: helm-chart-package
-          path: .chart-output/*.tgz
+          path: ${{ github.workspace }}/.chart-output/*.tgz   # ← absolute path
           retention-days: 1
           if-no-files-found: error
 
 # ─────────────────────────────────────────────────────────────────────────────
 # JOB 9 — Publish packaged chart to gh-pages
-#
-# Fresh runner workspace — no risk of branch switch wiping the .tgz.
-# Downloads the artifact from JOB 8, checks out gh-pages, updates index.yaml.
 # ─────────────────────────────────────────────────────────────────────────────
   helm-publish-ghpages:
     name: Publish Helm Chart to GitHub Pages
@@ -578,8 +561,6 @@ jobs:
       contents: write
 
     steps:
-      # Download artifact into this job's fresh workspace FIRST
-      # No git operations have touched the workspace yet — safe.
       - name: Download chart package artifact
         uses: actions/download-artifact@v4
         with:
@@ -600,14 +581,13 @@ jobs:
         with:
           version: latest
 
-      # Checkout gh-pages into a subdirectory so it never touches /tmp/chart-output
       - name: Checkout or create gh-pages branch
         uses: actions/checkout@v4
         with:
           ref: gh-pages
           token: ${{ secrets.GITHUB_TOKEN }}
-          path: gh-pages-dir        # checkout into subdir — keeps workspace clean
-        continue-on-error: true     # fails gracefully if gh-pages doesn't exist yet
+          path: gh-pages-dir
+        continue-on-error: true
 
       - name: Create gh-pages branch if it does not exist
         run: |
