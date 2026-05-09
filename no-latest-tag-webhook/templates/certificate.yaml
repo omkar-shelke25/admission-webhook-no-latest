@@ -1,0 +1,28 @@
+{{- if .Values.certManager.enabled }}
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ include "no-latest-tag-webhook.tlsSecretName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "no-latest-tag-webhook.labels" . | nindent 4 }}
+spec:
+  # cert-manager creates this Secret automatically with tls.crt and tls.key
+  secretName: {{ include "no-latest-tag-webhook.tlsSecretName" . }}
+  duration: {{ .Values.certManager.duration }}
+  renewBefore: {{ .Values.certManager.renewBefore }}
+  subject:
+    organizations:
+      - {{ .Release.Namespace }}
+  # dnsNames MUST match what the API server uses to reach the webhook service:
+  #   <service-name>.<namespace>.svc
+  #   <service-name>.<namespace>.svc.cluster.local
+  dnsNames:
+    - {{ include "no-latest-tag-webhook.fullname" . }}.{{ .Release.Namespace }}.svc
+    - {{ include "no-latest-tag-webhook.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local
+  issuerRef:
+    name: {{ include "no-latest-tag-webhook.clusterIssuerName" . }}
+    kind: ClusterIssuer
+    group: cert-manager.io
+{{- end }}
+
