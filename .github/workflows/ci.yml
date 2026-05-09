@@ -453,6 +453,12 @@ jobs:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # JOB 8 — Package Helm chart and upload as artifact
+#
+# ROOT CAUSE OF PREVIOUS FAILURES:
+#   ${{ github.workspace }} is a context expression — it is NOT expanded inside
+#   the `path:` field of actions/upload-artifact@v4.
+#   ${{ env.MY_VAR }} IS expanded by the action.
+#   Fix: write the absolute path into GITHUB_ENV first, then reference via env.
 # ─────────────────────────────────────────────────────────────────────────────
   helm-package:
     name: Package Helm Chart
@@ -466,31 +472,32 @@ jobs:
       chart-pkg: ${{ steps.package.outputs.chart-pkg }}
 
     steps:
-      # FIX 1: fetch-depth: 0 ensures the helm-update commit is included.
-      # Without this, a shallow clone may check out the commit BEFORE
-      # helm-update pushed the bumped Chart.yaml / values.yaml.
       - name: Checkout main
         uses: actions/checkout@v4
         with:
           ref: main
           token: ${{ secrets.GITHUB_TOKEN }}
-          fetch-depth: 0            # ← was 1; 0 = full history, gets helm-update commit
+          fetch-depth: 0            # full history — ensures helm-update commit is present
 
-      # FIX 2: Explicit pull guarantees we are on the very latest commit on main,
-      # not just whatever SHA actions/checkout resolved at job-queue time.
       - name: Pull latest main
-        run: git pull origin main
+        run: git pull origin main   # guarantee we are on the very latest commit
 
       - name: Set up Helm
         uses: azure/setup-helm@v4
         with:
           version: latest
 
-      # ── Step 1: confirm chart directory exists ──────────────────────────────
+      # ── Write absolute output path into GITHUB_ENV ──────────────────────────
+      # upload-artifact@v4 resolves ${{ env.VAR }} but NOT ${{ github.workspace }}
+      - name: Set chart output path
+        run: echo "CHART_OUTPUT=$GITHUB_WORKSPACE/.chart-output" >> "$GITHUB_ENV"
+
+      # ── Confirm chart directory exists ──────────────────────────────────────
       - name: Verify chart directory exists
         run: |
           set -e
           echo "HELM_CHART_PATH = ${{ env.HELM_CHART_PATH }}"
+          echo "CHART_OUTPUT    = $CHART_OUTPUT"
           echo ""
           echo "=== Repo root ==="
           ls -la
@@ -504,30 +511,30 @@ jobs:
           echo "=== templates/ ==="
           ls -la ${{ env.HELM_CHART_PATH }}/templates/
 
-      # ── Step 2: lint before packaging ──────────────────────────────────────
+      # ── Lint ────────────────────────────────────────────────────────────────
       - name: Lint Helm chart
         run: |
           set -e
           helm lint ${{ env.HELM_CHART_PATH }} --strict
           echo "Lint passed"
 
-      # ── Step 3: package ────────────────────────────────────────────────────
+      # ── Package ─────────────────────────────────────────────────────────────
       - name: Package Helm chart
         id: package
         run: |
           set -e
-          mkdir -p "$GITHUB_WORKSPACE/.chart-output"
+          mkdir -p "$CHART_OUTPUT"
 
           echo "=== Packaging chart ==="
           helm package ${{ env.HELM_CHART_PATH }} \
-            --destination "$GITHUB_WORKSPACE/.chart-output" \
+            --destination "$CHART_OUTPUT" \
             --debug
 
           echo ""
-          echo "=== .chart-output after packaging ==="
-          ls -lah "$GITHUB_WORKSPACE/.chart-output/"
+          echo "=== $CHART_OUTPUT after packaging ==="
+          ls -lah "$CHART_OUTPUT/"
 
-          TGZ=$(ls "$GITHUB_WORKSPACE/.chart-output/"*.tgz 2>/dev/null | head -1)
+          TGZ=$(ls "$CHART_OUTPUT/"*.tgz 2>/dev/null | head -1)
           if [ -z "${TGZ}" ]; then
             echo "ERROR: no .tgz found — helm package failed"
             exit 1
@@ -537,15 +544,13 @@ jobs:
           echo "chart-pkg=${CHART_PKG}" >> "$GITHUB_OUTPUT"
           echo "Successfully packaged: ${CHART_PKG}"
 
-      # ── Step 4: upload artifact ─────────────────────────────────────────────
-      # FIX 3: Use ${{ github.workspace }} (absolute path) instead of the
-      # relative .chart-output/*.tgz — eliminates any working-directory
-      # ambiguity between the run step and the upload-artifact action.
+      # ── Upload ──────────────────────────────────────────────────────────────
+      # ${{ env.CHART_OUTPUT }} is correctly expanded here; ${{ github.workspace }} is not.
       - name: Upload chart package as artifact
         uses: actions/upload-artifact@v4
         with:
           name: helm-chart-package
-          path: ${{ github.workspace }}/.chart-output/*.tgz   # ← absolute path
+          path: ${{ env.CHART_OUTPUT }}/*.tgz
           retention-days: 1
           if-no-files-found: error
 
