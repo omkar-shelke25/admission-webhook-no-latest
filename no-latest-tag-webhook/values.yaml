@@ -13,7 +13,7 @@ image:
   # -- Image pull policy
   pullPolicy: IfNotPresent
   # -- Image tag (overrides appVersion if set)
-  tag: "sha-62bff26"
+  tag: "sha-3316545"
 
 # -- Image pull secrets for private registries
 imagePullSecrets: []
