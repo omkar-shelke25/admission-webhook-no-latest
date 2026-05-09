@@ -9,10 +9,10 @@ on:
       - ".github/ISSUE_TEMPLATE/**"
       - ".github/PULL_REQUEST_TEMPLATE/**"
       - "docs/**"
-      - "*.txt"
+      
       - ".gitignore"
       - ".gitattributes"
-      - "helm/**/README.md"
+      
   pull_request:
     branches: ["main"]
     paths-ignore:
@@ -20,10 +20,9 @@ on:
       - ".github/ISSUE_TEMPLATE/**"
       - ".github/PULL_REQUEST_TEMPLATE/**"
       - "docs/**"
-      - "*.txt"
       - ".gitignore"
       - ".gitattributes"
-      - "helm/**/README.md"
+      
 
 env:
   IMAGE_NAME: ghcr.io/${{ github.repository }}
