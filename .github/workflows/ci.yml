@@ -23,12 +23,11 @@ on:
       - "*.txt"
       - ".gitignore"
       - ".gitattributes"
-      - "helm/**/README.md"
 
 env:
   IMAGE_NAME: ghcr.io/${{ github.repository }}
   GO_VERSION: "1.26"
-  HELM_CHART_PATH: helm/no-latest-tag-webhook
+  HELM_CHART_PATH: no-latest-tag-webhook
 
 # ─── Pipeline flow ────────────────────────────────────────────────────────────
 #
