@@ -2,7 +2,7 @@ apiVersion: v2
 name: no-latest-tag-webhook
 description: Kubernetes ValidatingAdmissionWebhook that blocks pods using :latest or untagged container images
 type: application
-version: 1.0.9
+version: 1.0.10
 appVersion: "1.0.0"
 keywords:
   - webhook
