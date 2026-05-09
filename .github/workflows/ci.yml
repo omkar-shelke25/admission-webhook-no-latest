@@ -373,7 +373,7 @@ jobs:
           NEW_TAG="${{ needs.build.outputs.image-tag }}"
           VALUES_FILE="${{ env.HELM_CHART_PATH }}/values.yaml"
           echo "Injecting image.tag: ${NEW_TAG} into ${VALUES_FILE}"
-          sed -i "s|^\(\s*tag:\s*\)\"sha-[a-f0-9]*\"|\1\"${NEW_TAG}\"|" "${VALUES_FILE}"
+          sed -i "s|^\(\s*tag:\s*\).*|\1\"${NEW_TAG}\"|" "${VALUES_FILE}"
           echo "--- Updated image block ---"
           grep -A4 "^image:" "${VALUES_FILE}"
 
