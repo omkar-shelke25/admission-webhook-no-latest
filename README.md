@@ -187,71 +187,8 @@ kubectl run test-good --image=nginx:1.27.0 -n default
 ## 🔄 CI Pipeline Structure
 
 The GitHub Actions pipeline runs automatically on every push to `main` (documentation changes are ignored).
+![Uploading LimitRanger Default-2026-05-10-055826.svg…]()
 
-```
-push to main
-    │
-    ▼
-┌─────────────────────────────────────────────────────────────┐
-│  JOB 1 — test                                               │
-│  Go unit tests + coverage report                            │
-└──────────────────────────┬──────────────────────────────────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────────────┐
-│  JOB 2 — build                                              │
-│  Docker build + push to GHCR                                │
-│  Outputs: image-tag (sha-xxxxxxx)                           │
-└──────────┬─────────────────────────┬────────────────────────┘
-           │                         │                    │
-           ▼                         ▼                    ▼
-┌──────────────────┐  ┌──────────────────┐  ┌────────────────────┐
-│  JOB 3 — sign    │  │  JOB 4 — trivy   │  │  JOB 5 — sbom      │
-│  Cosign keyless  │  │  Vuln scan       │  │  Syft SPDX +       │
-│  OIDC signing    │  │  SARIF → GitHub  │  │  CycloneDX         │
-└────────┬─────────┘  └────────┬─────────┘  └────────┬───────────┘
-         │                     │                      │
-         │                     │                      ▼
-         │                     │           ┌────────────────────┐
-         │                     │           │  JOB 6 — grype     │
-         │                     │           │  Scan from SBOM    │
-         │                     │           └────────┬───────────┘
-         │                     │                    │
-         └─────────────────────┴────────────────────┘
-                               │
-                    ALL must pass ✅
-                               │
-                               ▼
-┌─────────────────────────────────────────────────────────────┐
-│  JOB 7 — helm-update                                        │
-│  Inject image.tag into values.yaml                          │
-│  Bump Chart.yaml patch version                              │
-│  git commit [skip ci] → push to main                        │
-└──────────────────────────┬──────────────────────────────────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────────────┐
-│  JOB 8 — helm-package                                       │
-│  helm package → .tgz                                        │
-│  Upload as GitHub artifact                                  │
-└──────────────────────────┬──────────────────────────────────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────────────┐
-│  JOB 9 — helm-publish-ghpages                               │
-│  Download artifact → gh-pages branch                        │
-│  helm repo index --merge                                     │
-│  Push index.yaml + .tgz to gh-pages                        │
-└──────────────────────────┬──────────────────────────────────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────────────┐
-│  ArgoCD (GitOps)                               [WIP]        │
-│  Watches Helm repo on gh-pages                              │
-│  Auto-syncs when new chart version is published             │
-│  Deploys updated webhook to cluster                         │
-└─────────────────────────────────────────────────────────────┘
-```
 
 > **Note:** The ArgoCD deployment section is work in progress and will be completed in a future update.
 
