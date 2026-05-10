@@ -44,6 +44,15 @@ Images pinned to a digest (e.g. `nginx@sha256:abc123`) are always allowed.
 
 ---
 
+## 🔄 CI Pipeline Structure
+
+The GitHub Actions pipeline runs automatically on every push to `main` (documentation changes are ignored).
+
+<img width="8192" height="1224" alt="LimitRanger Default-2026-05-10-060032" src="https://github.com/user-attachments/assets/3ddb329f-9c3c-43ed-82db-b0da096086bd" />
+
+
+---
+
 ## ✅ Prerequisites
 
 | Tool | Version | Purpose |
@@ -181,18 +190,6 @@ kubectl run test-bad --image=nginx:latest -n default
 kubectl run test-good --image=nginx:1.27.0 -n default
 # Expected: pod/test-good created
 ```
-
----
-
-## 🔄 CI Pipeline Structure
-
-The GitHub Actions pipeline runs automatically on every push to `main` (documentation changes are ignored).
-
-<img width="8192" height="1224" alt="LimitRanger Default-2026-05-10-060032" src="https://github.com/user-attachments/assets/3ddb329f-9c3c-43ed-82db-b0da096086bd" />
-
-
-> **Note:** The ArgoCD deployment section is work in progress and will be completed in a future update.
-
 ---
 
 ## 📁 Repository Structure
